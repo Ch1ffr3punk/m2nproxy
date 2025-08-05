@@ -19,6 +19,11 @@ const (
 )
 
 func main() {
+	cert, err := tls.LoadX509KeyPair("cert.pem", "key.pem")
+	if err != nil {
+		log.Fatalf("Certificate error: %v", err)
+	}
+
 	listener, err := net.Listen("tcp", localSMTPServer)
 	if err != nil {
 		log.Fatalf("Failed to start server: %v", err)
@@ -33,11 +38,15 @@ func main() {
 			log.Printf("Accept error: %v", err)
 			continue
 		}
-		go handleConnection(conn)
+		go handleConnection(conn, &tls.Config{
+			Certificates:       []tls.Certificate{cert},
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS12,
+		})
 	}
 }
 
-func handleConnection(conn net.Conn) {
+func handleConnection(conn net.Conn, tlsConfig *tls.Config) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Minute))
 
@@ -47,31 +56,46 @@ func handleConnection(conn net.Conn) {
 	writer.WriteString("220 localhost ESMTP mail2news proxy\r\n")
 	writer.Flush()
 
-	var message strings.Builder
-	to := "mail2news@dizum.com"
+	var (
+		message  strings.Builder
+		usingTLS bool
+	)
 
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			if err.Error() != "EOF" {
-				log.Printf("Read error: %v", err)
-			}
 			return
 		}
 
 		line = strings.TrimRight(line, "\r\n")
-		if len(line) == 0 {
-			continue
-		}
-
 		cmd := strings.ToUpper(strings.Fields(line)[0])
+
 		switch cmd {
 		case "EHLO", "HELO":
-			writer.WriteString("250-localhost\r\n250-PIPELINING\r\n250 8BITMIME\r\n")
+			writer.WriteString("250-localhost\r\n250-STARTTLS\r\n250-PIPELINING\r\n250 8BITMIME\r\n")
+			writer.Flush()
+		case "STARTTLS":
+			if usingTLS {
+				writer.WriteString("503 Already in TLS\r\n")
+				writer.Flush()
+			} else {
+				writer.WriteString("220 Ready\r\n")
+				writer.Flush()
+				tlsConn := tls.Server(conn, tlsConfig)
+				if err := tlsConn.Handshake(); err != nil {
+					return
+				}
+				conn = tlsConn
+				reader = bufio.NewReader(conn)
+				writer = bufio.NewWriter(conn)
+				usingTLS = true
+			}
 		case "MAIL":
 			writer.WriteString("250 OK\r\n")
+			writer.Flush()
 		case "RCPT":
 			writer.WriteString("250 OK\r\n")
+			writer.Flush()
 		case "DATA":
 			writer.WriteString("354 End data with <CR><LF>.<CR><LF>\r\n")
 			writer.Flush()
@@ -80,7 +104,6 @@ func handleConnection(conn net.Conn) {
 			for {
 				line, err := reader.ReadString('\n')
 				if err != nil {
-					log.Printf("DATA read error: %v", err)
 					return
 				}
 				if strings.TrimSpace(line) == "." {
@@ -89,28 +112,25 @@ func handleConnection(conn net.Conn) {
 				message.WriteString(line)
 			}
 
-			if err := forwardMessage(to, message.String()); err != nil {
-				log.Printf("Forward error: %v", err)
+			if err := forwardMessage(message.String()); err != nil {
 				writer.WriteString("554 Forward error\r\n")
 			} else {
 				writer.WriteString("250 Message accepted\r\n")
 			}
+			writer.Flush()
 		case "QUIT":
 			writer.WriteString("221 Bye\r\n")
 			writer.Flush()
 			return
 		default:
 			writer.WriteString("502 Unsupported command\r\n")
+			writer.Flush()
 		}
-		writer.Flush()
 	}
 }
 
-func forwardMessage(to, msg string) error {
-	dialer, err := proxy.SOCKS5("tcp", torProxyAddr, nil, &net.Dialer{
-		Timeout:   2 * time.Minute,
-		KeepAlive: 1 * time.Minute,
-	})
+func forwardMessage(msg string) error {
+	dialer, err := proxy.SOCKS5("tcp", torProxyAddr, nil, proxy.Direct)
 	if err != nil {
 		return err
 	}
@@ -137,7 +157,8 @@ func forwardMessage(to, msg string) error {
 	if err := client.Mail(""); err != nil {
 		return err
 	}
-	if err := client.Rcpt(to); err != nil {
+
+	if err := client.Rcpt("mail2news@dizum.com"); err != nil {
 		return err
 	}
 
